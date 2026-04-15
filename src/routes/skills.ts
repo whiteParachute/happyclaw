@@ -4,6 +4,8 @@ import { Hono } from 'hono';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { Readable } from 'stream';
+import AdmZip from 'adm-zip';
 import type { Variables } from '../web-context.js';
 import type { AuthUser } from '../types.js';
 import { authMiddleware } from '../middleware/auth.js';
@@ -600,6 +602,280 @@ skillsRoutes.post('/sync-host', authMiddleware, async (c) => {
   const total = hostSkillNames.length;
   return c.json({ stats, total });
 });
+
+// --- Export skills as zip ---
+interface ExportSkillRef {
+  id: string;
+  source: 'user' | 'project';
+}
+
+skillsRoutes.post('/export', authMiddleware, async (c) => {
+  const authUser = c.get('user') as AuthUser;
+  const { skills: exportRefs } =
+    await c.req.json<{ skills: ExportSkillRef[] }>();
+
+  if (!Array.isArray(exportRefs) || exportRefs.length === 0) {
+    return c.json({ error: '请选择至少一个技能' }, 400);
+  }
+
+  for (const ref of exportRefs) {
+    if (!validateSkillId(ref.id)) {
+      return c.json({ error: `无效的技能 ID: ${ref.id}` }, 400);
+    }
+  }
+
+  // 项目级技能导出也需要 admin 权限（与导入对称）
+  const hasProjectRefs = exportRefs.some(ref => ref.source === 'project');
+  if (hasProjectRefs && authUser.role !== 'admin') {
+    return c.json({ error: '只有管理员可以导出项目级技能' }, 403);
+  }
+
+  const zip = new AdmZip();
+  const notFound: string[] = [];
+
+  for (const ref of exportRefs) {
+    const rootDir =
+      ref.source === 'project'
+        ? getProjectSkillsDir()
+        : getUserSkillsDir(authUser.id);
+    const skillDir = path.join(rootDir, ref.id);
+
+    if (!fs.existsSync(skillDir) || !validateSkillPath(rootDir, skillDir)) {
+      notFound.push(ref.id);
+      continue;
+    }
+
+    // 递归添加技能目录到 zip
+    addDirectoryToZip(zip, skillDir, ref.id);
+  }
+
+  if (notFound.length === exportRefs.length) {
+    return c.json({ error: `未找到任何技能: ${notFound.join(', ')}` }, 404);
+  }
+
+  const buffer = zip.toBuffer();
+  const filename =
+    exportRefs.length === 1 ? `${exportRefs[0].id}.zip` : 'skills-export.zip';
+
+  const stream = Readable.toWeb(
+    Readable.from(buffer),
+  ) as ReadableStream<Uint8Array>;
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/zip',
+    'Content-Disposition': `attachment; filename="${filename}"`,
+    'Content-Length': String(buffer.byteLength),
+  };
+  if (notFound.length > 0) {
+    headers['X-Skipped-Skills'] = notFound.join(',');
+  }
+
+  return new Response(stream, { headers });
+});
+
+/**
+ * 递归将目录内容添加到 zip 中（跳过隐藏文件）
+ */
+function addDirectoryToZip(
+  zip: AdmZip,
+  dirPath: string,
+  zipPrefix: string,
+): void {
+  const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue;
+    const fullPath = path.join(dirPath, entry.name);
+    const zipPath = `${zipPrefix}/${entry.name}`;
+    if (entry.isDirectory()) {
+      addDirectoryToZip(zip, fullPath, zipPath);
+    } else {
+      zip.addFile(zipPath, fs.readFileSync(fullPath));
+    }
+  }
+}
+
+// --- Import skills from file ---
+skillsRoutes.post('/import', authMiddleware, async (c) => {
+  const authUser = c.get('user') as AuthUser;
+  const body = await c.req.parseBody();
+  const file = body.file;
+  const target = (body.target as string) || 'user';
+
+  if (!(file instanceof File)) {
+    return c.json({ error: '请上传文件' }, 400);
+  }
+
+  if (target === 'project' && authUser.role !== 'admin') {
+    return c.json({ error: '只有管理员可以导入项目级技能' }, 403);
+  }
+
+  const targetDir =
+    target === 'project'
+      ? getProjectSkillsDir()
+      : getUserSkillsDir(authUser.id);
+  fs.mkdirSync(targetDir, { recursive: true });
+
+  const fileName = file.name;
+  const fileBuffer = Buffer.from(await file.arrayBuffer());
+
+  // 资源限制：防止 zip bomb
+  const MAX_UPLOAD_SIZE = 10 * 1024 * 1024; // 10MB
+  const MAX_ZIP_ENTRIES = 500;
+
+  if (fileBuffer.byteLength > MAX_UPLOAD_SIZE) {
+    return c.json({ error: `文件过大，上限 ${MAX_UPLOAD_SIZE / 1024 / 1024}MB` }, 400);
+  }
+
+  const imported: string[] = [];
+  const skipped: string[] = [];
+
+  if (fileName.endsWith('.md')) {
+    // 单个 SKILL.md 文件导入
+    const content = fileBuffer.toString('utf-8');
+    const frontmatter = parseFrontmatter(content);
+    const skillName = frontmatter.name;
+    if (!skillName || !validateSkillId(skillName)) {
+      return c.json(
+        {
+          error:
+            'SKILL.md 缺少有效的 name 字段（需符合 [\\w\\-]+ 格式）',
+        },
+        400,
+      );
+    }
+
+    const skillDir = path.join(targetDir, skillName);
+    if (fs.existsSync(skillDir)) {
+      skipped.push(skillName);
+    } else {
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.writeFileSync(path.join(skillDir, 'SKILL.md'), fileBuffer);
+      imported.push(skillName);
+    }
+  } else if (fileName.endsWith('.zip')) {
+    // zip 包导入
+    const zip = new AdmZip(fileBuffer);
+    const entries = zip.getEntries();
+
+    if (entries.length > MAX_ZIP_ENTRIES) {
+      return c.json({ error: `zip 条目过多（${entries.length}），上限 ${MAX_ZIP_ENTRIES}` }, 400);
+    }
+
+    // 判断 zip 结构：
+    // 1) 根目录直接包含 SKILL.md → 单技能包
+    // 2) 子目录各自包含 SKILL.md → 多技能包
+    const hasRootSkillMd = entries.some(
+      (e) => e.entryName === 'SKILL.md' || e.entryName === './SKILL.md',
+    );
+
+    if (hasRootSkillMd) {
+      // 单技能 zip：根目录就是技能内容
+      const skillMdEntry = entries.find(
+        (e) => e.entryName === 'SKILL.md' || e.entryName === './SKILL.md',
+      );
+      const content = skillMdEntry!.getData().toString('utf-8');
+      const frontmatter = parseFrontmatter(content);
+      const skillName = frontmatter.name;
+      if (!skillName || !validateSkillId(skillName)) {
+        return c.json(
+          { error: 'zip 中 SKILL.md 缺少有效的 name 字段' },
+          400,
+        );
+      }
+
+      const skillDir = path.join(targetDir, skillName);
+      if (fs.existsSync(skillDir)) {
+        skipped.push(skillName);
+      } else {
+        const tmpDir = skillDir + '.importing';
+        try {
+          extractSkillEntries(zip, entries, '', tmpDir);
+          fs.renameSync(tmpDir, skillDir);
+          imported.push(skillName);
+        } catch (err) {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+          skipped.push(skillName);
+        }
+      }
+    } else {
+      // 多技能 zip：每个顶层子目录是一个技能
+      const topDirs = new Set<string>();
+      for (const entry of entries) {
+        const parts = entry.entryName.split('/').filter(Boolean);
+        if (parts.length >= 1) topDirs.add(parts[0]);
+      }
+
+      for (const dirName of topDirs) {
+        if (!validateSkillId(dirName)) {
+          skipped.push(dirName);
+          continue;
+        }
+
+        // 检查该子目录下是否有 SKILL.md
+        const hasSkillMd = entries.some(
+          (e) =>
+            e.entryName === `${dirName}/SKILL.md` ||
+            e.entryName === `${dirName}/SKILL.md.disabled`,
+        );
+        if (!hasSkillMd) {
+          skipped.push(dirName);
+          continue;
+        }
+
+        const skillDir = path.join(targetDir, dirName);
+        if (fs.existsSync(skillDir)) {
+          skipped.push(dirName);
+          continue;
+        }
+
+        const dirEntries = entries.filter((e) =>
+          e.entryName.startsWith(`${dirName}/`),
+        );
+        const tmpDir = skillDir + '.importing';
+        try {
+          extractSkillEntries(zip, dirEntries, `${dirName}/`, tmpDir);
+          fs.renameSync(tmpDir, skillDir);
+          imported.push(dirName);
+        } catch (err) {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+          skipped.push(dirName);
+        }
+      }
+    }
+  } else {
+    return c.json({ error: '仅支持 .md 或 .zip 文件' }, 400);
+  }
+
+  return c.json({ imported, skipped });
+});
+
+/**
+ * 从 zip 中提取技能文件到目标目录
+ */
+function extractSkillEntries(
+  zip: AdmZip,
+  entries: AdmZip.IZipEntry[],
+  prefix: string,
+  destDir: string,
+): void {
+  fs.mkdirSync(destDir, { recursive: true });
+  for (const entry of entries) {
+    if (entry.isDirectory) continue;
+    // 去掉前缀得到相对路径
+    let relativePath = entry.entryName;
+    if (prefix && relativePath.startsWith(prefix)) {
+      relativePath = relativePath.slice(prefix.length);
+    }
+    if (!relativePath || relativePath.startsWith('.')) continue;
+
+    const destPath = path.resolve(destDir, relativePath);
+    // 防止路径穿越：resolve 后用 relative 检查是否仍在目标目录内
+    const rel = path.relative(destDir, destPath);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) continue;
+
+    fs.mkdirSync(path.dirname(destPath), { recursive: true });
+    fs.writeFileSync(destPath, entry.getData());
+  }
+}
 
 export { getUserSkillsDir, deleteSkillForUser };
 export default skillsRoutes;

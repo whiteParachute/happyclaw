@@ -1,5 +1,6 @@
 import { create } from 'zustand';
-import { api } from '../api/client';
+import { api, apiFetch } from '../api/client';
+import { withBasePath } from '../utils/url';
 
 export interface Skill {
   id: string;
@@ -30,6 +31,8 @@ interface SkillsState {
   toggleSkill: (id: string, enabled: boolean) => Promise<void>;
   deleteSkill: (id: string) => Promise<void>;
   getSkillDetail: (id: string) => Promise<SkillDetail>;
+  exportSkills: (skills: Array<{ id: string; source: 'user' | 'project' }>) => Promise<void>;
+  importSkills: (file: File, target: 'user' | 'project') => Promise<{ imported: string[]; skipped: string[] }>;
 }
 
 export const useSkillsStore = create<SkillsState>((set, get) => ({
@@ -71,5 +74,41 @@ export const useSkillsStore = create<SkillsState>((set, get) => ({
   getSkillDetail: async (id: string) => {
     const data = await api.get<{ skill: SkillDetail }>(`/api/skills/${id}`);
     return data.skill;
+  },
+
+  exportSkills: async (skills: Array<{ id: string; source: 'user' | 'project' }>) => {
+    const res = await fetch(withBasePath('/api/skills/export'), {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ skills }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || '导出失败');
+    }
+    const blob = await res.blob();
+    const filename = skills.length === 1 ? `${skills[0].id}.zip` : 'skills-export.zip';
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  },
+
+  importSkills: async (file: File, target: 'user' | 'project') => {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('target', target);
+    const result = await apiFetch<{ imported: string[]; skipped: string[] }>(
+      '/api/skills/import',
+      { method: 'POST', body: formData, headers: {} },
+    );
+    await get().loadSkills();
+    return result;
   },
 }));
