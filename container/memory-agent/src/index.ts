@@ -136,16 +136,17 @@ memoryDir/
 ├── personality.md            — 用户交互风格记录
 ├── changelog.md              — 变更日志（每次 wrapup/sleep 追加记录）
 ├── knowledge/                — 按领域组织的详细知识
+├── knowledge/.pending/       — 多源写入临时文件（等待 global_sleep 合并）
 ├── impressions/              — 按会话组织的语义索引文件
 ├── impressions/archived/     — 超过 6 个月的旧 impression
 ├── daily/                    — Daily Notes（每天一个 YYYY-MM-DD.md）
+├── .last-sleep-at            — 跨机 global_sleep 水位（Git 同步，ISO8601 时间戳）
 ├── .obsidian/                — Obsidian 配置（忽略，不读不写不搜索）
 └── .git/                     — Git 同步（忽略）
 \`\`\`
 
-注意：对话记录（transcripts）不存储于记忆目录。Claude Code 自动维护 transcript 于
-\`~/.claude/projects/[project-path]/[session-id].jsonl\`，wrapup 时父进程通过 transcriptFile
-参数传入完整路径，你按路径直接读取。
+注意：对话记录（transcripts）不存储于记忆目录。父进程通过 transcriptFile
+参数传入完整路径，你按路径直接读取。transcript 可能是 JSONL（Claude Code）或 Markdown（IM 会话）格式。
 
 ## 忽略目录
 
@@ -154,6 +155,14 @@ memoryDir/
 - \`.git/\` — Git 版本控制
 
 Glob 示例：使用 \`knowledge/*.md\` 而非 \`**/*.md\`，避免匹配到 \`.obsidian/\` 下的文件。
+
+## 多源写入架构
+
+本 Memory Agent 运行在多端写入环境中（SG lark-bridge、CN dbclaw、Mac Obsidian 三端同时写同一个 Git 仓库）。
+为避免冲突，wrapup 遵循以下分层原则：
+- **wrapup 只写原材料**（impressions 新建 + knowledge 新建或 .pending/）
+- **不写** index.md、changelog.md、daily/、personality.md（这些由 global_sleep 统一汇总）
+- knowledge 已有文件**不直接追加**，改写 \`knowledge/.pending/\` 临时文件
 
 ## Frontmatter 处理规则
 
@@ -223,7 +232,7 @@ knowledge/ 和 impressions/ 中的文件可能包含 YAML frontmatter（\`---\` 
 
 ---
 
-### 三、session_wrapup — 会话收尾（9 步）
+### 三、session_wrapup — 会话收尾（7 步）
 
 请求可能包含 \`processPending: true\`，此时：
 1. 读取 meta.json 的 \`pendingWrapups\` 数组
@@ -231,18 +240,30 @@ knowledge/ 和 impressions/ 中的文件可能包含 YAML frontmatter（\`---\` 
 3. 处理完后从 \`pendingWrapups\` 移除该条目
 4. 更新 meta.json
 
-**单个 wrapup 流程（9 步）**：
+**单个 wrapup 流程（7 步）**：
 
 #### 步骤 1：读取并解析 transcript
 
-读取 transcriptFile（JSONL 格式，每行一个 JSON 对象）。解析规则：
+读取 transcriptFile，支持两种格式：
+
+**格式 A：JSONL（Claude Code 会话，\`.jsonl\` 后缀）**
+- 每行一个 JSON 对象
 - 过滤 \`type: "user"\`（且 message.content 为 string，非 tool_result）和 \`type: "assistant"\` 的记录
-- 从 assistant 记录的 \`message.content\` 数组中提取 \`type: "text"\` 的文本
+- 从 assistant 记录的 \`message.content\` 数组中提取 \`type: "text"\` 的文本内容
 - 忽略 \`type: "thinking"\`、\`type: "tool_use"\`、\`type: "tool_result"\` 等辅助记录
-- 提取 \`timestamp\`、\`cwd\`、\`sessionId\`
+- 提取每条记录的 \`timestamp\`、\`cwd\`、\`sessionId\`
 - 将 user/assistant 对话按时间顺序配对
 
-如 transcript 不存在或为空，跳过并返回提示。
+**格式 B：Markdown（IM 会话，\`.md\` 后缀）**
+- 纯 Markdown 文本，包含用户和助手的对话记录
+- 格式通常为 \`**User** (时间): 内容\` 和 \`**Assistant** (时间): 内容\` 交替
+- 按 bold 标记（\`**User**\`/\`**Assistant**\`）分割对话对
+- 从文件头部提取会话元信息（群组名、日期等）
+- channel 标记为 \`im\`（区别于 Claude Code 的 \`flow\`/\`main\`）
+
+**格式检测**：根据文件扩展名（\`.jsonl\` vs \`.md\`）或首行内容（是否为有效 JSON）自动判断格式。
+
+如果 transcript 文件不存在或为空，跳过并返回提示。
 
 #### 步骤 2：提炼对话内容
 
@@ -259,7 +280,7 @@ knowledge/ 和 impressions/ 中的文件可能包含 YAML frontmatter（\`---\` 
 title: "主题描述"
 type: impression
 date: YYYY-MM-DD
-channel: flow|main|feishu
+channel: flow|main|feishu|im
 session_id: "sessionId"
 tags: [tag1, tag2, tag3]
 produces: [[相关knowledge文件名]]
@@ -285,76 +306,101 @@ produces: [[相关knowledge文件名]]
 - [[相关knowledge文件名]]（新增/更新了什么）
 \`\`\`
 
-#### 步骤 4：更新 knowledge 文件
+#### 步骤 4：更新 knowledge 文件（多源写入安全）
 
-对话中有需持久化的知识时：
-- 更新或创建 knowledge/ 文件（分类逻辑同 remember）
-- 新建必须带 frontmatter，更新时刷新 \`updated\` 日期
-- 内容中跨文件引用使用 \`[[wikilink]]\`
+如果对话中包含应持久化的知识：
 
-#### 步骤 5：更新 index.md
+**写入规则（多源冲突避免）**：
+- 用 Glob 列出 \`knowledge/*.md\` 已有文件
+- **目标文件不存在** → 直接新建（与 remember 相同的 frontmatter 模板）
+- **目标文件已存在** → **不直接追加**，改为写临时文件到 \`knowledge/.pending/\` 目录：
+  - 文件名格式：\`{原文件名}_{source_id}_{wrapup_id}_{时间戳}.md\`
+  - source_id：当前端点标识（\`sg-happyclaw\`）
+  - wrapup_id：本次 wrapup 的唯一标识（使用 sessionId 的前 8 位）
+  - 时间戳：\`YYYYMMDDHHmmss\` 格式（UTC）
+  - 示例：\`feishu-bridge_sg-happyclaw_fdcff362_20260414163000.md\`
+- 临时文件 frontmatter 中必须包含幂等键：
+  \`\`\`yaml
+  ---
+  title: "待合并：原文件标题"
+  type: knowledge-pending
+  target: "原文件名.md"
+  source_id: "sg-happyclaw"
+  wrapup_id: "fdcff362"
+  created: YYYY-MM-DD
+  tags: [pending-merge]
+  ---
+  \`\`\`
+- 临时文件正文为需要追加/更新到目标文件的内容片段
+- **global_sleep 会扫描 \`.pending/\` 目录并合并到主文件**
 
-- 「近期上下文」分区添加 \`- [YYYY-MM-DD] 会话摘要 → [[impression文件名]]\`
-- 重要事实在对应分区添加/更新 \`- [YYYY-MM-DD] 描述 → [[knowledge文件名]]\`
-- 分区超限时降级「备用」或删除最旧条目
+**新建文件时**：
+- 必须包含 YAML frontmatter（见 remember 流程中的模板）
+- 文件内容中引用其他文件使用 \`[[wikilink]]\` 格式
 
-#### 步骤 6：交叉修复
+#### ~~步骤 5：更新 index.md~~ — 已移至 global_sleep
 
-对话引用了旧记忆（用户说"之前聊的XXX"）时：
-- 检查对应旧 impression 是否仍准确，修复过时内容
-- 在旧 impression 中添加交叉引用到本次新 impression
+> **多源写入架构变更**：wrapup 不再直接更新 index.md。索引的更新统一由 global_sleep 汇总层执行，避免多端并发写同一文件导致冲突。
 
-#### 步骤 7：更新 meta.json
+#### 步骤 5：交叉修复
 
-- \`totalImpressions\` += 1
-- \`indexVersion\` += 1
-- 如有新 knowledge 文件，\`totalKnowledgeFiles\` += 1
+如果本次对话中引用了旧记忆（用户说"之前聊的XXX"），检查：
+- 对应的旧 impressions 文件是否仍然准确
+- 如果旧信息已被更新/纠正，修复旧文件中的过时内容
+- 在旧 impression 文件中添加交叉引用到本次新 impression
+
+#### 步骤 6：更新 meta.json
+
+- 增加 \`totalImpressions\`
+- 增加 \`indexVersion\`
+- 如有新 knowledge 文件，增加 \`totalKnowledgeFiles\`
 - 只操作 meta.json，**绝不读写 state.json**
 
-#### 步骤 8：追加 changelog.md
+#### ~~步骤 7：追加 changelog.md~~ — 已移至 global_sleep
 
-在 \`# Changelog\` 标题后、已有条目之前追加：
+> **多源写入架构变更**：wrapup 不再追加 changelog.md。变更日志统一由 global_sleep 汇总写入。
 
-\`\`\`markdown
-## YYYY-MM-DD HH:MM
-- **wrapup**: session <sessionId> (<channel>, <duration>)
-- **新建**: impressions/YYYY-MM-DD_主题.md
-- **更新**: knowledge/xxx.md (+变更摘要)
-- **索引**: 添加 N 条到「近期上下文」
-\`\`\`
+#### ~~步骤 8：追加 Daily Note~~ — 已移至 global_sleep
 
-不存在则创建（带 frontmatter \`type: meta\`，标题 \`# Changelog\`）。
+> **多源写入架构变更**：wrapup 不再追加 daily 文件。Daily Note 的生成和合并统一由 global_sleep 执行，避免多端写同一 daily 文件冲突。
 
-**膨胀控制**：超过 500 行时，将 3 个月前旧条目归档到 \`changelog-YYYY-Qn.md\`（按季度分片），主文件只保留最近 3 个月。
+#### 步骤 7：Git 提交推送
 
-#### 步骤 9：追加 Daily Note
-
-在 \`daily/YYYY-MM-DD.md\`（使用 sessionDate）追加本次会话摘要。
-
-文件不存在则创建：
-\`\`\`markdown
----
-title: "YYYY-MM-DD"
-type: daily
-date: YYYY-MM-DD
----
-
-# YYYY-MM-DD
-\`\`\`
-
-末尾追加：\`- HH:MM [[impression文件名]] — 一句话会话摘要\`
-
-HH:MM 用 UTC+8 北京时间。如无法精确获取，从 transcript 首条 timestamp 推算。
+wrapup 完成后执行 Git 同步：
+- \`git add -A && git commit -m "wrapup: <session_id简短> <日期>"\`
+- push 失败时 pull --rebase → retry，最多 3 次
+- 3 次仍失败则写入 \`.git-push-failed\` 标记文件（内容为失败时间+错误信息）
 
 ---
 
-### 四、global_sleep — 全局维护（9 步）
+### 四、global_sleep — 全局维护（12 步）
 
 #### 步骤 1：备份 index.md
 
 \`cp index.md index.md.bak\`（如已存在 .bak.1 / .bak.2 的三版轮转，保持轮转：.bak.1 → .bak.2，当前 → .bak.1）
 
-#### 步骤 2：压缩 index.md（容量维护）
+#### 步骤 2：\`.pending/\` 膨胀检查（多源写入安全）
+
+扫描 \`knowledge/.pending/\` 目录：
+- 统计文件数量
+- **超过 50 个**：在 changelog.md 记录 \`⚠️ .pending/ 膨胀告警：N 个待合并文件\`
+- **超过 100 个**：额外在返回结果中标注 \`🚨 .pending/ 严重膨胀\`，提示用户关注
+
+#### 步骤 3：合并 \`.pending/\` 临时文件（多源写入核心）
+
+扫描 \`knowledge/.pending/*.md\` 中的所有临时文件：
+
+1. 读取每个临时文件的 frontmatter，提取 \`target\`（目标主文件名）和 \`wrapup_id\`（幂等键）
+2. **幂等去重**：如果有多个临时文件 \`wrapup_id\` 相同且 \`target\` 相同，只处理最新的一个
+3. 对每个目标文件：
+   - 读取目标主文件当前内容
+   - **冲突检测**：如果目标文件的 mtime > 临时文件的 ctime（说明 Mac 端在 pending 创建后手动编辑过），执行智能合并（保留两者内容），而非覆盖
+   - 将临时文件的正文内容追加到目标主文件合适位置
+   - 更新目标文件的 \`updated\` 日期
+4. 合并完成后删除已处理的临时文件
+5. 如果目标主文件不存在（被删除了），将临时文件直接重命名为正式文件（去掉 source_id/wrapup_id/时间戳后缀）
+
+#### 步骤 4：压缩 index.md（容量维护）
 
 统计各分区条目数。分区上限：关于用户(~30) / 活跃话题(~50) / 重要提醒(~20) / 近期上下文(~50) / 备用(~50)，总上限 ~200。
 
@@ -364,34 +410,35 @@ compact 判断框架：
 3. **降级候选**：事实类保留久于事件类；knowledge/ 已有详细记录的索引可简洁
 4. **降级路径**：近期上下文 → 备用 → 删除（确保 knowledge/ 或 impressions/ 有存档后才删）
 
-#### 步骤 3：过期清理与归档
+#### 步骤 5：重建 index.md（汇总层职责）
+
+> **多源写入架构变更**：index.md 的更新从 wrapup 移至 global_sleep，由汇总层统一执行。
+
+- 扫描全量 impressions/ 和 knowledge/ 文件
+- 基于最新内容重建各分区的索引条目
+- 格式：\`- [YYYY-MM-DD] 描述 → [[文件名]]\`（wikilink 格式）
+- 补充新增文件的索引、移除已删除文件的悬空引用
+- 确保格式规范：无旧格式 \`→ knowledge/xxx.md\`，统一为 \`→ [[xxx]]\`
+
+#### 步骤 6：过期清理与归档
 
 - 扫描「重要提醒」，已过期的移除
 - \`impressions/\` 中超过 6 个月的文件移动到 \`impressions/archived/\`
 - knowledge/ 中超过 6 个月未更新的标记为低活跃
 
-#### 步骤 4：拆分 / 合并 knowledge 文件
+#### 步骤 7：拆分 / 合并 knowledge 文件
 
 - **拆分**：超过 200 行的文件按子领域拆，\`knowledge/xxx.md\` → \`knowledge/xxx/_index.md\` + 子文件
   - _index.md 包含整体摘要、各子文件的一句话描述
   - 最多三层
 - **合并**：<10 行且领域相近的文件合并
 - 拆分/合并后更新 index.md 对应索引条目
-- **See Also 双向链接**（增量）：只处理本周期新增/修改的文件（用 \`lastGlobalSleepAt\` 判断），维护文件末尾的 \`## See Also\` 区：
+- **See Also 双向链接**（增量）：只处理本周期新增/修改的文件（用 \`.last-sleep-at\` 判断），维护文件末尾的 \`## See Also\` 区：
   - 3-6 条相关文件，使用 \`[[wikilink]]\` + 一句话描述
   - A 引用 B，B 必须反向引用 A
   - 首次执行分批处理，每次 10-15 个
 
-#### 步骤 5：自审索引质量
-
-- 悬空引用（指向不存在的文件）→ 移除
-- 重复条目 → 合并
-- 旧格式指针 \`→ knowledge/xxx.md\` → 统一转 \`→ [[xxx]]\`
-- 格式不规范条目（无 \`[YYYY-MM-DD]\` 前缀）→ 修正
-- 模糊条目（"聊了一些东西"）→ 具体化或删除
-- 分区标题和注释完整
-
-#### 步骤 6：更新 personality.md
+#### 步骤 8：更新 personality.md
 
 综合所有 impression 的情感标记和交互模式，更新 personality.md 四类：
 - 用户的**沟通风格**（简洁/详细、正式/随意、中文/英文偏好）
@@ -401,7 +448,7 @@ compact 判断框架：
 
 只记录观察模式，不做价值判断。
 
-#### 步骤 7：更新 meta.json
+#### 步骤 9：更新 meta.json
 
 - \`lastGlobalSleepAt\` = 当前精确 ISO 时间（Bash: \`date -u +%Y-%m-%dT%H:%M:%S.000000+00:00\`，不可近似）
 - \`indexVersion\` += 1
@@ -411,12 +458,23 @@ compact 判断框架：
 - 清空 \`pendingWrapups\` 数组
 - **绝不操作 state.json**
 
-#### 步骤 8：每日摘要（daily 补全）
+#### 步骤 10：更新 \`.last-sleep-at\`（跨机水位同步）
 
-1. Glob \`impressions/YYYY-MM-DD_*.md\`（不含 archived/），提取日期集合
-2. Glob \`daily/YYYY-MM-DD.md\` 已有文件，得到已生成日期集合
-3. 对每个缺失的日期，读取该日所有 impression，生成 \`daily/YYYY-MM-DD.md\`：
+> **Codex Review 采纳 #1**：lastGlobalSleepAt 从 meta.json 移到 Git 同步的 \`.last-sleep-at\` 文件。
 
+- 将当前精确 ISO 时间写入 \`.last-sleep-at\`（纯文本文件，只含一个 ISO8601 时间戳）
+- 此文件加入 Git 跟踪（不在 .gitignore 中），确保跨机同步
+- meta.json 中的 \`lastGlobalSleepAt\` 仍然更新，作为本地缓存兼容
+
+#### 步骤 11：生成每日摘要（daily 生成+合并）
+
+> **多源写入架构变更**：daily 文件的生成从 wrapup 移至 global_sleep 统一执行。
+
+1. 用 Glob 列出 \`impressions/YYYY-MM-DD_*.md\` 所有文件（不含 archived/），提取不重复的日期集合
+2. 用 Glob 列出 \`daily/YYYY-MM-DD.md\` 已有文件
+3. 对每个日期的处理：
+
+**daily 文件格式**（含用户手记分区）：
 \`\`\`markdown
 ---
 title: "Daily: YYYY-MM-DD"
@@ -433,24 +491,55 @@ sessions: N
 
 ## 未解决 / 明日跟进
 - 待办
+
+<!-- aria:user-start -->
+<!-- aria:user-end -->
 \`\`\`
 
-规则：
-- 只写有实质内容的段落（无决策则省略「关键决策」段）
-- 每段 3-5 条，总文件不超过 20 行正文
-- 「今日进展」聚焦成果（"完成了X"而非"讨论了X"）
-- 跳过 \`impressions/archived/\`
-- 已有 daily 文件（由 wrapup Step 9 创建）跳过不覆盖
+> **Codex Review 采纳 #4**：用户手记区域使用 HTML 注释 \`<!-- aria:user-start -->\` / \`<!-- aria:user-end -->\` 标记，替代旧的 \`## 手记\`。Obsidian 渲染时不可见，解析更可靠。
 
-#### 步骤 9：追加 changelog.md
+**合并策略**：
+
+| 文件状态 | 处理方式 |
+|----------|----------|
+| 文件不存在 | 直接新建（含 \`<!-- aria:user-start/end -->\` 标记） |
+| 文件只有 frontmatter / 空壳（无实质正文） | 覆盖（Obsidian Daily Notes 插件自动创建的空文件） |
+| 文件已存在且有实质内容 | 合并：保留 \`<!-- aria:user-start -->\` 到 \`<!-- aria:user-end -->\` 之间的内容不动，只重写上方 AI 段落（整体替换，幂等） |
+
+**旧标记迁移**：如果已有 daily 文件使用旧的 \`## 手记\` 标记，自动替换为 \`<!-- aria:user-start -->\` / \`<!-- aria:user-end -->\`，保留其中内容。
+
+**生成规则**：
+- 只写有实质内容的段落——无决策则省略「关键决策」段，无待办则省略「未解决」段
+- 每段控制在 3-5 条以内，总文件不超过 20 行正文（不含手记区域）
+- 「今日进展」聚焦成果而非过程（"完成了X"而非"讨论了X"）
+- 跳过 \`impressions/archived/\` 中的文件，只处理活跃 impressions
+- AI 段落重写时整体替换（幂等），不是追加
+
+#### 步骤 12：追加 changelog.md
+
+在 changelog.md 追加本次 global_sleep 的变更记录：
 
 \`\`\`markdown
 ## YYYY-MM-DD HH:MM
 - **global_sleep**: 索引压缩 vN，归档 M 条 impression
+- **pending 合并**: 处理 N 个 .pending/ 文件
 - **更新**: personality.md (变更摘要)
 - **拆分/合并**: knowledge/xxx.md → knowledge/yyy.md + knowledge/zzz.md
-- **daily 补全**: 新生成 N 个 daily 文件
+- **daily 生成**: 新生成/更新 N 个 daily 文件
+- **手记标记迁移**: 迁移 N 个 daily 文件的旧 ## 手记 标记
 \`\`\`
+
+如果 changelog.md 不存在，创建它（带 frontmatter）：
+\`\`\`markdown
+---
+title: "Memory Changelog"
+type: meta
+---
+
+# Changelog
+\`\`\`
+
+**膨胀控制**：如果 changelog.md 超过 500 行，将旧条目（超过 3 个月的）归档到 \`changelog-YYYY-Qn.md\`（按季度分片），只在主文件保留最近 3 个月的记录。
 
 ---
 
@@ -483,6 +572,7 @@ sessions: N
 10. **不读写记忆目录外的文件**：除父进程传入的 transcriptFile 绝对路径外，所有文件操作限定在工作目录内
 11. **原子写入 meta.json**：先读取完整内容再写回，避免部分写入损坏
 12. **忽略目录**：\`.obsidian/ .git/\` 在所有 Glob/Grep/Read 中必须排除
+13. **多源写入纪律**：wrapup 绝不写 index.md、changelog.md、daily/、personality.md，这些由 global_sleep 统一维护
 
 ---
 
@@ -535,7 +625,7 @@ function buildPrompt(request: MemoryRequest): string {
           ``,
           `当前时间：${new Date().toISOString()}`,
           ``,
-          `请读取 meta.json 的 pendingWrapups 数组，对每个 pending 条目依次执行 session_wrapup 的 9 步流程；`,
+          `请读取 meta.json 的 pendingWrapups 数组，对每个 pending 条目依次执行 session_wrapup 的 7 步流程；`,
           `每处理完一条，从 pendingWrapups 中移除并更新 meta.json。全部完成后输出处理摘要。`,
         ].join('\n');
       }
@@ -549,16 +639,16 @@ function buildPrompt(request: MemoryRequest): string {
         request.channelLabel ? `渠道标签：${request.channelLabel}` : '',
         `当前时间：${new Date().toISOString()}`,
         ``,
-        `请严格按照 session_wrapup 处理流程的 9 个步骤处理这次对话：`,
-        `1. 读取并解析 transcript（JSONL）`,
+        `请严格按照 session_wrapup 处理流程的 7 个步骤处理这次对话：`,
+        `1. 读取并解析 transcript（自动检测 JSONL 或 Markdown 格式）`,
         `2. 提炼对话内容（事实 / 决策 / 问题 / 待办 / 情感）`,
         `3. 创建 impression 文件（impressions/YYYY-MM-DD_主题.md，含 frontmatter）`,
-        `4. 更新 knowledge 文件（含 frontmatter，使用 [[wikilink]]）`,
-        `5. 更新 index.md（近期上下文 + 重要事实分区）`,
-        `6. 交叉修复（引用旧记忆时修复对应 impression）`,
-        `7. 更新 meta.json（totalImpressions、indexVersion、totalKnowledgeFiles）— 禁止读写 state.json`,
-        `8. 追加 changelog.md（超 500 行按季度分片）`,
-        `9. 追加 daily/YYYY-MM-DD.md（HH:MM UTC+8 一句话摘要）`,
+        `4. 更新 knowledge 文件（多源安全：新建直接写，已有文件写 knowledge/.pending/）`,
+        `5. 交叉修复（引用旧记忆时修复对应 impression）`,
+        `6. 更新 meta.json（totalImpressions、indexVersion、totalKnowledgeFiles）— 禁止读写 state.json`,
+        `7. Git 提交推送（git add -A && commit && push，失败 pull --rebase retry 最多 3 次）`,
+        ``,
+        `⚠️ 多源写入纪律：不要写 index.md、changelog.md、daily/、personality.md（由 global_sleep 统一维护）`,
         ``,
         `全部完成后输出处理摘要。`,
       ]
@@ -571,16 +661,19 @@ function buildPrompt(request: MemoryRequest): string {
         ``,
         `当前时间：${new Date().toISOString()}`,
         ``,
-        `请严格按照 global_sleep 处理流程的 9 个步骤逐步执行全局维护：`,
-        `1. 备份 index.md（index.md.bak，或管理 .bak.1 / .bak.2 轮转）`,
-        `2. 压缩 index.md（容量压力 × 保护规则 × 降级候选框架）`,
-        `3. 过期清理与归档（过期提醒 / 6 个月+ impressions → impressions/archived/）`,
-        `4. 拆分 / 合并 knowledge 文件（>200 行拆，<10 行合；维护 ## See Also 双向链接）`,
-        `5. 自审索引质量（悬空、重复、旧格式指针、缺日期、模糊条目）`,
-        `6. 更新 personality.md（沟通风格 / 技术偏好 / 工作模式 / 敏感话题）`,
-        `7. 更新 meta.json（lastGlobalSleepAt、indexVersion、totalImpressions、totalKnowledgeFiles、totalDailyFiles、清空 pendingWrapups）— 禁止读写 state.json`,
-        `8. daily 补全（对比 impressions/ 与 daily/，为缺失日期生成 daily 摘要）`,
-        `9. 追加 changelog.md`,
+        `请严格按照 global_sleep 处理流程的 12 个步骤逐步执行全局维护：`,
+        `1. 备份 index.md（index.md.bak，三版轮转）`,
+        `2. .pending/ 膨胀检查（>50 告警，>100 严重）`,
+        `3. 合并 .pending/ 临时文件（幂等去重 + mtime 冲突检测 + 智能合并）`,
+        `4. 压缩 index.md（容量压力 × 保护规则 × 降级候选框架）`,
+        `5. 重建 index.md（扫描全量 impressions + knowledge，补充新增、移除悬空）`,
+        `6. 过期清理与归档（过期提醒 / 6 个月+ impressions → impressions/archived/）`,
+        `7. 拆分 / 合并 knowledge 文件（>200 行拆，<10 行合；维护 ## See Also 双向链接，用 .last-sleep-at 判断增量）`,
+        `8. 更新 personality.md（沟通风格 / 技术偏好 / 工作模式 / 敏感话题）`,
+        `9. 更新 meta.json（lastGlobalSleepAt、indexVersion、重新计算各 total、清空 pendingWrapups）— 禁止读写 state.json`,
+        `10. 更新 .last-sleep-at（写入当前 ISO 时间，Git 同步的跨机水位）`,
+        `11. 生成每日摘要（daily 生成+合并，含 <!-- aria:user-start/end --> 手记分区，旧 ## 手记 自动迁移）`,
+        `12. 追加 changelog.md（含 pending 合并、daily 生成、手记标记迁移统计）`,
         ``,
         `每完成一个步骤后，继续执行下一步。全部完成后输出维护报告摘要。`,
       ].join('\n');
@@ -690,7 +783,7 @@ async function main(): Promise<void> {
   log(`Starting Memory Agent (model: ${MODEL}, dir: ${MEMORY_DIR})`);
 
   // Ensure memory directory structure exists
-  for (const subdir of ['knowledge', 'impressions', 'impressions/archived', 'daily']) {
+  for (const subdir of ['knowledge', 'knowledge/.pending', 'impressions', 'impressions/archived', 'daily']) {
     fs.mkdirSync(path.join(MEMORY_DIR, subdir), { recursive: true });
   }
 
