@@ -1,5 +1,5 @@
 /**
- * Shared types for HappyClaw Agent Runner.
+ * Shared types for AgentDock Agent Runner.
  *
  * These types are used across index.ts, stream-processor.ts, and mcp-tools.ts.
  */
@@ -7,10 +7,28 @@
 // Streaming event types (canonical source: shared/stream-event.ts)
 export type { StreamEventType, StreamEvent } from './stream-event.types.js';
 import type { StreamEvent } from './stream-event.types.js';
+import type { RunnerDescriptor } from './runner-descriptor.types.js';
+
+export interface RunnerResolvedConfig {
+  profileId?: string;
+  model?: string;
+  thinkingEffort?: 'low' | 'medium' | 'high';
+  command?: string;
+  config: Record<string, unknown>;
+}
 
 export interface ContainerInput {
   prompt: string;
+  runnerId: string;
+  runnerConfig?: RunnerResolvedConfig;
+  declaredRunnerDescriptor?: RunnerDescriptor;
+  declaredIpcCapabilities?: {
+    midQueryPush: boolean;
+    runtimeModeSwitch: boolean;
+  };
   sessionId?: string;
+  resumeAnchor?: string;
+  workspaceFolder?: string;
   groupFolder: string;
   chatJid: string;
   /** Whether this is the user's home container (admin or member). */
@@ -26,14 +44,30 @@ export interface ContainerInput {
   turnId?: string;
   /** Compressed conversation summary from previous session. */
   contextSummary?: string;
+  bootstrapState?: {
+    providerState?: Record<string, unknown>;
+    recentImChannels?: string[];
+    imChannelLastSeen?: Record<string, number>;
+    currentPermissionMode?: string | null;
+    lastMessageCursor?: string | null;
+  };
 }
 
 export interface ContainerOutput {
-  status: 'success' | 'error' | 'stream' | 'closed' | 'drained';
+  status: 'success' | 'error' | 'stream' | 'closed' | 'drained' | 'heartbeat';
   result: string | null;
   newSessionId?: string;
   error?: string;
   streamEvent?: StreamEvent;
+  runtimeState?: {
+    providerSessionId?: string;
+    resumeAnchor?: string;
+    providerState?: Record<string, unknown>;
+    recentImChannels: string[];
+    imChannelLastSeen: Record<string, number>;
+    currentPermissionMode: string;
+    lastMessageCursor?: string | null;
+  };
 }
 
 export interface SessionEntry {

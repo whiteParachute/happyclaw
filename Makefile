@@ -1,13 +1,15 @@
 .PHONY: dev dev-backend dev-web build build-backend build-web build-memory-agent start \
-       typecheck typecheck-backend typecheck-web typecheck-agent-runner-core typecheck-agent-runner typecheck-memory-agent \
-       format format-check install clean reset-init update-sdk sync-types \
+       typecheck typecheck-backend typecheck-web typecheck-agent-runner-core typecheck-agent-runner typecheck-memory-agent test-runner-contracts \
+       format format-check install clean reset-init sync-types ensure-deps \
        backup restore help
 
 # ─── Development ─────────────────────────────────────────────
 
-dev: ## 启动前后端（首次自动安装依赖和构建容器镜像）
-	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
-	@if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && ! docker image inspect happyclaw-agent:latest >/dev/null 2>&1; then echo "🐳 构建 Agent 容器镜像..."; ./container/build.sh; fi
+ensure-deps: ## 检查依赖是否齐全，缺失时自动安装
+	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ ! -d web/node_modules ] || [ web/package.json -nt web/node_modules ] || [ ! -d container/agent-runner-core/node_modules ] || [ container/agent-runner-core/package.json -nt container/agent-runner-core/node_modules ] || [ ! -d container/agent-runner/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ] || [ ! -d container/memory-agent/node_modules ] || [ container/memory-agent/package.json -nt container/memory-agent/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
+
+dev: ensure-deps ## 启动前后端（首次自动安装依赖和构建容器镜像）
+	@if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && ! docker image inspect agentdock-agent:latest >/dev/null 2>&1; then echo "🐳 构建 Agent 容器镜像..."; ./container/build.sh; fi
 	@npm --prefix container/agent-runner run build --silent 2>/dev/null || npm --prefix container/agent-runner run build
 	@npm --prefix container/memory-agent run build --silent 2>/dev/null || npm --prefix container/memory-agent run build
 	npm run dev:all
@@ -20,7 +22,7 @@ dev-web: ## 仅启动前端
 
 # ─── Build ───────────────────────────────────────────────────
 
-build: sync-types ## 编译前后端及 agent-runner
+build: ensure-deps sync-types ## 编译前后端及 agent-runner
 	npm run build:all
 	npm --prefix container/agent-runner-core run build
 	npm --prefix container/agent-runner run build
@@ -37,15 +39,14 @@ build-memory-agent: ## 仅编译 memory-agent
 
 # ─── Production ──────────────────────────────────────────────
 
-start: ## 一键启动生产环境（首次自动安装依赖和构建容器镜像）
-	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
-	@if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && ! docker image inspect happyclaw-agent:latest >/dev/null 2>&1; then echo "🐳 构建 Agent 容器镜像..."; ./container/build.sh; fi
+start: ensure-deps ## 一键启动生产环境（首次自动安装依赖和构建容器镜像）
+	@if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && ! docker image inspect agentdock-agent:latest >/dev/null 2>&1; then echo "🐳 构建 Agent 容器镜像..."; ./container/build.sh; fi
 	$(MAKE) build
 	npm run start
 
 # ─── Quality ─────────────────────────────────────────────────
 
-typecheck: sync-types typecheck-backend typecheck-web typecheck-agent-runner-core typecheck-agent-runner typecheck-memory-agent ## 全量类型检查
+typecheck: sync-types typecheck-backend typecheck-web typecheck-agent-runner-core typecheck-agent-runner typecheck-memory-agent test-runner-contracts ## 全量类型检查
 	@./scripts/check-stream-event-sync.sh
 
 typecheck-backend:
@@ -63,6 +64,9 @@ typecheck-agent-runner:
 typecheck-memory-agent:
 	cd container/memory-agent && npx tsc --noEmit
 
+test-runner-contracts:
+	npm run test:runner-contracts
+
 format: ## 格式化代码
 	npm run format
 
@@ -73,12 +77,6 @@ format-check: ## 检查代码格式
 
 sync-types: ## 同步 shared/ 下的类型定义到各子项目
 	@./scripts/sync-stream-event.sh
-
-# ─── SDK ─────────────────────────────────────────────────────
-
-update-sdk: ## 更新 agent-runner 的 Claude Agent SDK 到最新版本
-	cd container/agent-runner && npm update @anthropic-ai/claude-agent-sdk && npm run build
-	@echo "SDK updated. Run 'make typecheck' to verify."
 
 # ─── Setup ───────────────────────────────────────────────────
 
@@ -106,9 +104,9 @@ reset-init: ## 完全重置为首装状态（清空所有运行时数据）
 
 # ─── Backup / Restore ────────────────────────────────────────
 
-backup: ## 备份运行时数据到 happyclaw-backup-{date}.tar.gz
+backup: ## 备份运行时数据到 agentdock-backup-{date}.tar.gz
 	@DATE=$$(date +%Y%m%d-%H%M%S); \
-	FILE="happyclaw-backup-$$DATE.tar.gz"; \
+	FILE="agentdock-backup-$$DATE.tar.gz"; \
 	echo "📦 正在打包备份到 $$FILE ..."; \
 	tar -czf "$$FILE" \
 	  --exclude='data/ipc' \
@@ -125,17 +123,17 @@ backup: ## 备份运行时数据到 happyclaw-backup-{date}.tar.gz
 	  2>/dev/null; \
 	echo "✅ 备份完成：$$FILE ($$(du -sh $$FILE | cut -f1))"
 
-restore: ## 从 happyclaw-backup-*.tar.gz 恢复数据（用法：make restore 或 make restore FILE=xxx.tar.gz）
+restore: ## 从 agentdock-backup-*.tar.gz 恢复数据（用法：make restore 或 make restore FILE=xxx.tar.gz）
 	@if [ -n "$(FILE)" ]; then \
 	  BACKUP="$(FILE)"; \
-	elif [ $$(ls happyclaw-backup-*.tar.gz 2>/dev/null | wc -l) -eq 1 ]; then \
-	  BACKUP=$$(ls happyclaw-backup-*.tar.gz); \
-	elif [ $$(ls happyclaw-backup-*.tar.gz 2>/dev/null | wc -l) -gt 1 ]; then \
+	elif [ $$(ls agentdock-backup-*.tar.gz 2>/dev/null | wc -l) -eq 1 ]; then \
+	  BACKUP=$$(ls agentdock-backup-*.tar.gz); \
+	elif [ $$(ls agentdock-backup-*.tar.gz 2>/dev/null | wc -l) -gt 1 ]; then \
 	  echo "❌ 发现多个备份文件，请用 make restore FILE=xxx.tar.gz 指定："; \
-	  ls happyclaw-backup-*.tar.gz; \
+	  ls agentdock-backup-*.tar.gz; \
 	  exit 1; \
 	else \
-	  echo "❌ 未找到备份文件，请将 happyclaw-backup-*.tar.gz 放到当前目录"; \
+	  echo "❌ 未找到备份文件，请将 agentdock-backup-*.tar.gz 放到当前目录"; \
 	  exit 1; \
 	fi; \
 	echo "📂 正在从 $$BACKUP 恢复..."; \

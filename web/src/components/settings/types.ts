@@ -66,102 +66,40 @@ export interface SettingsNotification {
 }
 
 export interface SystemSettings {
-  containerTimeout: number;
+  runtimeTimeout: number;
   idleTimeout: number;
-  containerMaxOutputSize: number;
-  maxConcurrentContainers: number;
-  maxConcurrentHostProcesses: number;
-  maxLoginAttempts: number;
-  loginLockoutMinutes: number;
+  runtimeMaxOutputSize: number;
+  maxConcurrentRuntimes: number;
   maxConcurrentScripts: number;
+  maxConcurrentWorkflowNodes: number;
   scriptTimeout: number;
-  billingEnabled: boolean;
-  billingMode: 'wallet_first';
-  billingMinStartBalanceUsd: number;
-  billingCurrency: string;
-  billingCurrencyRate: number;
+  queryActivityTimeoutMs: number;
+  toolCallHardTimeoutMs: number;
   memoryQueryTimeout: number;
   memoryGlobalSleepTimeout: number;
   memorySendTimeout: number;
   turnBatchWindowMs: number;
   turnMaxBatchMs: number;
   traceRetentionDays: number;
+  feishuApiDomain: string;
+  feishuDocDomain: string;
   webPublicUrl: string;
   defaultClaudeModel: string;
 }
 
-export type SettingsTab = 'claude' | 'codex' | 'registration' | 'appearance' | 'system' | 'profile' | 'my-channels' | 'security' | 'groups' | 'memory' | 'skills' | 'mcp-servers' | 'agent-definitions' | 'users' | 'about' | 'bindings';
-
-// ─── Codex Provider Types ───────────────────────────────────────
-
-export interface CodexConfigPublic {
-  mode: 'cli' | 'api_key';
-  hasCliAuth: boolean;
-  cliAuthMode: string | null;
-  cliAuthAccountId: string | null;
-  cliAuthLastRefresh: string | null;
-  hasEnvApiKey: boolean;
-}
-
-export interface CodexProfileItem {
-  id: string;
-  name: string;
-  baseUrl: string;
-  defaultModel: string;
-  updatedAt: string | null;
-  hasOpenaiApiKey: boolean;
-  openaiApiKeyMasked: string | null;
-  customEnv: Record<string, string>;
-}
-
-export interface CodexProfilesResp {
-  activeProfileId: string;
-  profiles: CodexProfileItem[];
-}
-
-export interface CodexActivateResult {
-  success: boolean;
-  alreadyActive?: boolean;
-  activeProfileId: string;
-  profile: CodexProfileItem | null;
-  stoppedCount: number;
-  failedCount: number;
-  error?: string;
-}
-
-export interface LocalCodexCliStatus {
-  detected: boolean;
-  hasAuth: boolean;
-  authMode: string | null;
-  accountId: string | null;
-  lastRefresh: string | null;
-}
-
-// ─── Codex Rate Limits ─────────────────────────────────────
-
-export interface CodexRateLimitWindow {
-  usedPercent: number;
-  windowDurationMins: number;
-  resetsAt: number;
-}
-
-export interface CodexRateLimitCredits {
-  hasCredits: boolean;
-  unlimited: boolean;
-  balance: string;
-}
-
-export interface CodexRateLimitData {
-  limitId: string | null;
-  planType: string | null;
-  primary: CodexRateLimitWindow | null;
-  secondary: CodexRateLimitWindow | null;
-  credits: CodexRateLimitCredits | null;
-}
-
-export type CodexRateLimitsResponse =
-  | { available: true; rateLimits: CodexRateLimitData }
-  | { available: false; reason: string };
+export type SettingsTab =
+  | 'runners'
+  | 'appearance'
+  | 'system'
+  | 'profile'
+  | 'channels'
+  | 'sessions'
+  | 'memory'
+  | 'skills'
+  | 'mcp-servers'
+  | 'agent-definitions'
+  | 'about'
+  | 'bindings';
 
 export function getErrorMessage(err: unknown, fallback: string): string {
   if (typeof err === 'object' && err !== null && 'message' in err) {

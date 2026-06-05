@@ -11,18 +11,16 @@ import { useAuthStore } from '../../stores/auth';
 export interface ChatGroupItemProps {
   jid: string;
   name: string;
-  folder: string;
+  sessionSlug: string;
   lastMessage?: string;
-  executionMode?: 'container' | 'host';
-  isShared?: boolean;
-  memberRole?: 'owner' | 'member';
-  memberCount?: number;
   isActive: boolean;
   isHome: boolean;
   isPinned?: boolean;
+  runnerLabel?: string;
+  model?: string;
   editable?: boolean;
   deletable?: boolean;
-  onSelect: (jid: string, folder: string) => void;
+  onSelect: (jid: string, sessionSlug: string) => void;
   onRename?: (jid: string, name: string) => void;
   onClearHistory: (jid: string, name: string) => void;
   onDelete?: (jid: string, name: string) => void;
@@ -32,15 +30,13 @@ export interface ChatGroupItemProps {
 export function ChatGroupItem({
   jid,
   name,
-  folder,
+  sessionSlug,
   lastMessage,
-  executionMode,
-  isShared,
-  memberRole,
-  memberCount,
   isActive,
   isHome,
   isPinned,
+  runnerLabel,
+  model,
   editable,
   deletable,
   onSelect,
@@ -50,7 +46,7 @@ export function ChatGroupItem({
   onTogglePin,
 }: ChatGroupItemProps) {
   const currentUser = useAuthStore((s) => s.user);
-  const defaultHomeName = '我的工作区';
+  const defaultHomeName = '我的主会话';
   // Use actual name if it's been renamed, otherwise fall back to default
   const isDefaultName = !name || name === 'Main' || name === `${currentUser?.username} Home`;
   const displayName = isHome && isDefaultName ? defaultHomeName : name;
@@ -69,7 +65,7 @@ export function ChatGroupItem({
       )}
     >
       <button
-        onClick={() => onSelect(jid, folder)}
+        onClick={() => onSelect(jid, sessionSlug)}
         className="w-full text-left px-3 pr-12 py-2.5 cursor-pointer"
       >
         <div className="flex items-center gap-1.5">
@@ -87,23 +83,12 @@ export function ChatGroupItem({
           >
             {displayName}
           </span>
-          {executionMode === 'host' ? (
-            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-100 text-amber-700">
-              宿主机
-            </span>
-          ) : executionMode === 'container' ? (
-            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-sky-100 text-sky-700">
-              Docker
-            </span>
-          ) : null}
-          {isShared && memberRole === 'owner' && (memberCount ?? 0) >= 2 && (
-            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-purple-100 text-purple-700">
-              Owner
-            </span>
-          )}
-          {isShared && memberRole !== 'owner' && (memberCount ?? 0) >= 2 && (
-            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-violet-100 text-violet-700">
-              {memberCount}人协作
+          {(model || runnerLabel) && (
+            <span className={cn(
+              'inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium',
+              model ? 'bg-orange-100 text-orange-700' : 'bg-slate-100 text-slate-600',
+            )}>
+              {model || runnerLabel}
             </span>
           )}
         </div>
@@ -148,7 +133,7 @@ export function ChatGroupItem({
               className="text-amber-700 focus:text-amber-700"
             >
               <RotateCcw className="w-4 h-4" />
-              重建工作区
+              重建会话
             </DropdownMenuItem>
             {!isHome && deletable && onDelete && (
               <DropdownMenuItem

@@ -1,6 +1,5 @@
 /**
- * Shared output parsing and process lifecycle logic for container-runner.
- * Extracted from runContainerAgent() and runHostAgent() to eliminate duplication.
+ * Shared output parsing and process lifecycle logic for the unified local runtime.
  */
 import fs from 'fs';
 import path from 'path';
@@ -8,7 +7,7 @@ import type { Readable } from 'stream';
 
 import { getSystemSettings } from './runtime-config.js';
 import { logger } from './logger.js';
-import type { ContainerOutput } from './container-runner.js';
+import type { RuntimeOutput } from './runtime-runner.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 export const OUTPUT_START_MARKER = '---HAPPYCLAW_OUTPUT_START---';
@@ -33,9 +32,9 @@ export interface StdoutParserState {
 
 export interface StdoutParserOptions {
   groupName: string;
-  /** Label used in log messages, e.g. "Container" or "Host agent" */
+  /** Label used in log messages, e.g. "Runtime" */
   label: string;
-  onOutput?: (output: ContainerOutput) => Promise<void>;
+  onOutput?: (output: RuntimeOutput) => Promise<void>;
   resetTimeout: () => void;
 }
 
@@ -64,7 +63,7 @@ export function attachStdoutHandler(
     // Always accumulate for logging
     if (!state.stdoutTruncated) {
       const remaining =
-        getSystemSettings().containerMaxOutputSize - state.stdout.length;
+        getSystemSettings().runtimeMaxOutputSize - state.stdout.length;
       if (chunk.length > remaining) {
         state.stdout += chunk.slice(0, remaining);
         state.stdoutTruncated = true;
@@ -108,7 +107,7 @@ export function attachStdoutHandler(
         );
 
         try {
-          const parsed: ContainerOutput = JSON.parse(jsonStr);
+          const parsed: RuntimeOutput = JSON.parse(jsonStr);
           if (parsed.newSessionId) {
             state.newSessionId = parsed.newSessionId;
           }
@@ -129,7 +128,10 @@ export function attachStdoutHandler(
           }
           // Activity detected — reset the hard timeout
           opts.resetTimeout();
-          // Call onOutput for all markers (including null results)
+          if (parsed.status === 'heartbeat') {
+            continue;
+          }
+          // Call onOutput for all non-heartbeat markers (including null results)
           // so idle timers start even for "silent" query completions.
           const onOutputFn = opts.onOutput;
           state.outputChain = state.outputChain
@@ -169,7 +171,7 @@ export function attachStderrHandler(
   stream: Readable,
   state: StderrState,
   groupName: string,
-  /** Log context key: { container: folder } or { host: folder } */
+  /** Log context key: runtime namespace marker such as { container: folder } or { host: folder } */
   logContext: Record<string, string>,
 ): void {
   stream.on('data', (data) => {
@@ -182,13 +184,13 @@ export function attachStderrHandler(
     // Timeout only resets on actual output (OUTPUT_MARKER in stdout).
     if (state.stderrTruncated) return;
     const remaining =
-      getSystemSettings().containerMaxOutputSize - state.stderr.length;
+      getSystemSettings().runtimeMaxOutputSize - state.stderr.length;
     if (chunk.length > remaining) {
       state.stderr += chunk.slice(0, remaining);
       state.stderrTruncated = true;
       logger.warn(
         { group: groupName, size: state.stderr.length },
-        `${Object.keys(logContext)[0] === 'container' ? 'Container' : 'Host agent'} stderr truncated due to size limit`,
+        'Runtime stderr truncated due to size limit',
       );
     } else {
       state.stderr += chunk;
@@ -200,11 +202,11 @@ export function attachStderrHandler(
 
 export interface CloseHandlerContext {
   groupName: string;
-  /** "Container" or "Host Agent" — used for log titles */
+  /** Runtime label used for log titles */
   label: string;
-  /** "container" or "host" — used for log filenames */
+  /** Runtime identifier prefix used for log filenames */
   filePrefix: string;
-  /** containerName or processId */
+  /** Runtime instance identifier */
   identifier: string;
   logsDir: string;
   input: {
@@ -216,8 +218,8 @@ export interface CloseHandlerContext {
   };
   stdoutState: StdoutParserState;
   stderrState: StderrState;
-  onOutput?: (output: ContainerOutput) => Promise<void>;
-  resolvePromise: (output: ContainerOutput) => void;
+  onOutput?: (output: RuntimeOutput) => Promise<void>;
+  resolvePromise: (output: RuntimeOutput) => void;
   startTime: number;
   timeoutMs: number;
   /** Extra log lines for the "Input Summary" section (e.g. Mounts, Working Directory) */
@@ -243,6 +245,38 @@ export function handleTimeoutClose(
 ): boolean {
   if (!timedOut) return false;
 
+  // If the runtime already emitted a successful terminal marker and then
+  // exited with code 0, this is the common idle-shutdown race: the hard
+  // runtime timer fired at the same time the host wrote the idle _close
+  // sentinel. Treat it as a normal idle exit instead of surfacing a false
+  // "Local Runtime timed out" to users.
+  if (code === 0 && ctx.stdoutState.hasSuccessOutput && ctx.onOutput) {
+    const { newSessionId, outputChain, hasClosedOutput, hasDrainedOutput } =
+      ctx.stdoutState;
+    logger.warn(
+      { group: ctx.groupName, duration, newSessionId },
+      `${ctx.label} timeout raced with successful idle shutdown; treating as success`,
+    );
+    waitForOutputChain(
+      outputChain,
+      ctx.groupName,
+      `${ctx.filePrefix} timeout-idle-race path`,
+      () => {
+        const finalStatus = hasClosedOutput
+          ? ('closed' as const)
+          : hasDrainedOutput
+            ? ('drained' as const)
+            : ('success' as const);
+        ctx.resolvePromise({
+          status: finalStatus,
+          result: null,
+          newSessionId,
+        });
+      },
+    );
+    return true;
+  }
+
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
   fs.mkdirSync(ctx.logsDir, { recursive: true });
   const timeoutLog = path.join(ctx.logsDir, `${ctx.filePrefix}-${ts}.log`);
@@ -252,7 +286,7 @@ export function handleTimeoutClose(
       `=== ${ctx.label} Run Log (TIMEOUT) ===`,
       `Timestamp: ${new Date().toISOString()}`,
       `Group: ${ctx.groupName}`,
-      `${ctx.label === 'Container' ? 'Container' : 'Process ID'}: ${ctx.identifier}`,
+      `Runtime Identifier: ${ctx.identifier}`,
       `Duration: ${duration}ms`,
       `Exit Code: ${code}`,
     ].join('\n'),
@@ -261,8 +295,7 @@ export function handleTimeoutClose(
   logger.error(
     {
       group: ctx.groupName,
-      [ctx.filePrefix === 'container' ? 'containerName' : 'processId']:
-        ctx.identifier,
+      runtimeIdentifier: ctx.identifier,
       duration,
       code,
     },
@@ -541,7 +574,7 @@ function parseLegacyOutput(ctx: CloseHandlerContext): void {
       jsonLine = lines[lines.length - 1];
     }
 
-    const output: ContainerOutput = JSON.parse(jsonLine);
+    const output = parseLastNonHeartbeatOutput(jsonLine, stdout);
 
     logger.info(
       {
@@ -571,4 +604,36 @@ function parseLegacyOutput(ctx: CloseHandlerContext): void {
       error: `Failed to parse ${ctx.filePrefix} output: ${err instanceof Error ? err.message : String(err)}`,
     });
   }
+}
+
+function parseLastNonHeartbeatOutput(
+  fallbackJsonLine: string,
+  stdout: string,
+): RuntimeOutput {
+  let searchFrom = 0;
+  let lastOutput: RuntimeOutput | null = null;
+
+  while (true) {
+    const startIdx = stdout.indexOf(OUTPUT_START_MARKER, searchFrom);
+    if (startIdx === -1) break;
+    const endIdx = stdout.indexOf(OUTPUT_END_MARKER, startIdx);
+    if (endIdx === -1) break;
+    searchFrom = endIdx + OUTPUT_END_MARKER.length;
+
+    const markerJson = stdout
+      .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
+      .trim();
+    try {
+      const output: RuntimeOutput = JSON.parse(markerJson);
+      if (output.status !== 'heartbeat') {
+        lastOutput = output;
+      }
+    } catch {
+      // Preserve legacy behavior: a bad later marker should not hide an earlier
+      // valid result in the accumulated stdout.
+    }
+  }
+
+  if (lastOutput) return lastOutput;
+  return JSON.parse(fallbackJsonLine);
 }
